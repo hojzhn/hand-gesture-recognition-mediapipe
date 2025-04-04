@@ -61,104 +61,122 @@ def main():
     mp_hands = mp.solutions.hands
     hands = mp_hands.Hands(
         static_image_mode=use_static_image_mode,
-        max_num_hands=1,
+        max_num_hands=2,
         min_detection_confidence=min_detection_confidence,
         min_tracking_confidence=min_tracking_confidence,
     )
 
     keypoint_classifier = KeyPointClassifier()
-
     point_history_classifier = PointHistoryClassifier()
 
     # Read labels ###########################################################
-    with open('model/keypoint_classifier/keypoint_classifier_label.csv',
-              encoding='utf-8-sig') as f:
-        keypoint_classifier_labels = csv.reader(f)
-        keypoint_classifier_labels = [
-            row[0] for row in keypoint_classifier_labels
-        ]
-    with open(
-            'model/point_history_classifier/point_history_classifier_label.csv',
-            encoding='utf-8-sig') as f:
-        point_history_classifier_labels = csv.reader(f)
-        point_history_classifier_labels = [
-            row[0] for row in point_history_classifier_labels
-        ]
+    with open('model/keypoint_classifier/keypoint_classifier_label.csv', encoding='utf-8-sig') as f:
+        keypoint_classifier_labels = [row[0] for row in csv.reader(f)]
+    with open('model/point_history_classifier/point_history_classifier_label.csv', encoding='utf-8-sig') as f:
+        point_history_classifier_labels = [row[0] for row in csv.reader(f)]
 
     # FPS Measurement ########################################################
     cvFpsCalc = CvFpsCalc(buffer_len=10)
 
-    # Coordinate history #################################################################
-    history_length = 16
-    point_history = deque(maxlen=history_length)
+    # Movement thresholds ####################################################
+    movement_direction_threshold = 5.0  # min speed to classify direction
+    motion_state_threshold = 5.0        # avg speed to classify as Moving
 
-    # Finger gesture history ################################################
+    # Histories #############################################################
+    history_length = 16
+    point_histories = {"Left": deque(maxlen=history_length), "Right": deque(maxlen=history_length)}
+    speed_histories = {"Left": deque(maxlen=5), "Right": deque(maxlen=5)}
+    direction_history = {"Left": deque(maxlen=5), "Right": deque(maxlen=5)}
+    presence_history = {"Left": deque(maxlen=15), "Right": deque(maxlen=15)}
     finger_gesture_history = deque(maxlen=history_length)
 
-    #  ########################################################################
+    # Last-known values #####################################################
+    last_known = {
+        "Left": {"direction": "-", "speed": "0.00", "avg_speed": "0.00", "motion": "-", "present": False},
+        "Right": {"direction": "-", "speed": "0.00", "avg_speed": "0.00", "motion": "-", "present": False},
+    }
+
     mode = 0
 
     while True:
         fps = cvFpsCalc.get()
-
-        # Process Key (ESC: end) #################################################
         key = cv.waitKey(10)
-        if key == 27:  # ESC
+        if key == 27:
             break
         number, mode = select_mode(key, mode)
 
-        # Camera capture #####################################################
         ret, image = cap.read()
         if not ret:
             break
-        image = cv.flip(image, 1)  # Mirror display
+        image = cv.flip(image, 1)
         debug_image = copy.deepcopy(image)
 
-        # Detection implementation #############################################################
         image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
-
         image.flags.writeable = False
         results = hands.process(image)
         image.flags.writeable = True
 
-        #  ####################################################################
+        detected_labels = []
+
         if results.multi_hand_landmarks is not None:
-            for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
-                                                  results.multi_handedness):
-                # Bounding box calculation
+            for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+                hand_label = handedness.classification[0].label  # "Left" or "Right"
+                detected_labels.append(hand_label)
+
                 brect = calc_bounding_rect(debug_image, hand_landmarks)
-                # Landmark calculation
                 landmark_list = calc_landmark_list(debug_image, hand_landmarks)
 
-                # Conversion to relative coordinates / normalized coordinates
-                pre_processed_landmark_list = pre_process_landmark(
-                    landmark_list)
-                pre_processed_point_history_list = pre_process_point_history(
-                    debug_image, point_history)
-                # Write to the dataset file
-                logging_csv(number, mode, pre_processed_landmark_list,
-                            pre_processed_point_history_list)
+                pre_processed_landmark_list = pre_process_landmark(landmark_list)
+                pre_processed_point_history_list = pre_process_point_history(debug_image, point_histories[hand_label])
 
-                # Hand sign classification
-                hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
-                if hand_sign_id == 2:  # Point gesture
-                    point_history.append(landmark_list[8])
+                logging_csv(number, mode, pre_processed_landmark_list, pre_processed_point_history_list)
+
+                presence_history[hand_label].append(True)
+                point_histories[hand_label].append(landmark_list[8])
+
+                # Speed & Direction
+                if len(point_histories[hand_label]) >= 2:
+                    dx = point_histories[hand_label][-1][0] - point_histories[hand_label][-2][0]
+                    dy = point_histories[hand_label][-1][1] - point_histories[hand_label][-2][1]
+
+                    speed = np.clip((dx**2 + dy**2)**0.5, 0, 50)
+                    speed_histories[hand_label].append(speed)
+                    avg_speed = sum(speed_histories[hand_label]) / len(speed_histories[hand_label])
+                    motion_state = "Still" if avg_speed < motion_state_threshold else "Moving"
+
+                    if speed < movement_direction_threshold:
+                        raw_direction = "-"
+                    else:
+                        if abs(dx) > abs(dy):
+                            raw_direction = "Right" if dx > 0 else "Left"
+                        else:
+                            raw_direction = "Down" if dy > 0 else "Up"
+
+                    direction_history[hand_label].append(raw_direction)
+                    smoothed_direction = Counter(direction_history[hand_label]).most_common(1)[0][0]
                 else:
-                    point_history.append([0, 0])
+                    smoothed_direction = "-"
+                    speed = 0.0
+                    avg_speed = 0.0
+                    motion_state = "-"
 
-                # Finger gesture classification
-                finger_gesture_id = 0
-                point_history_len = len(pre_processed_point_history_list)
-                if point_history_len == (history_length * 2):
-                    finger_gesture_id = point_history_classifier(
-                        pre_processed_point_history_list)
+                # Update last known
+                presence_score = sum(presence_history[hand_label]) / len(presence_history[hand_label])
+                last_known[hand_label] = {
+                    "direction": smoothed_direction,
+                    "speed": f"{speed:.2f}",
+                    "avg_speed": f"{avg_speed:.2f}",
+                    "motion": motion_state,
+                    "present": presence_score > 0.4,
+                }
 
-                # Calculates the gesture IDs in the latest detection
-                finger_gesture_history.append(finger_gesture_id)
-                most_common_fg_id = Counter(
-                    finger_gesture_history).most_common()
+                # Gesture classification
+                hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
+                if len(pre_processed_point_history_list) == history_length * 2:
+                    gesture_id = point_history_classifier(pre_processed_point_history_list)
+                    finger_gesture_history.append(gesture_id)
 
-                # Drawing part
+                most_common_fg_id = Counter(finger_gesture_history).most_common()
                 debug_image = draw_bounding_rect(use_brect, debug_image, brect)
                 debug_image = draw_landmarks(debug_image, landmark_list)
                 debug_image = draw_info_text(
@@ -166,20 +184,39 @@ def main():
                     brect,
                     handedness,
                     keypoint_classifier_labels[hand_sign_id],
-                    point_history_classifier_labels[most_common_fg_id[0][0]],
+                    point_history_classifier_labels[most_common_fg_id[0][0]] if most_common_fg_id else "",
                 )
-        else:
-            point_history.append([0, 0])
 
-        debug_image = draw_point_history(debug_image, point_history)
+        # Fallback when no hand detected
+        for label in ["Left", "Right"]:
+            if label not in detected_labels:
+                presence_history[label].append(False)
+                point_histories[label].append([0, 0])
+
+            presence_score = sum(presence_history[label]) / len(presence_history[label])
+            presence_symbol = "O" if presence_score > 0.3 else "X"
+            info = last_known[label]
+            x_offset = 10 if label == "Left" else 330
+
+            debug_image = draw_status_panel(
+                debug_image,
+                f"{label} {presence_symbol}",
+                info["direction"],
+                info["speed"],
+                info["avg_speed"],
+                info["motion"],
+                x_offset=x_offset
+            )
+
+        # Final overlays
+        debug_image = draw_point_history(debug_image, point_histories["Left"])
+        debug_image = draw_point_history(debug_image, point_histories["Right"])
         debug_image = draw_info(debug_image, fps, mode, number)
 
-        # Screen reflection #############################################################
         cv.imshow('Hand Gesture Recognition', debug_image)
 
     cap.release()
     cv.destroyAllWindows()
-
 
 def select_mode(key, mode):
     number = -1
@@ -536,6 +573,25 @@ def draw_info(image, fps, mode, number):
             cv.putText(image, "NUM:" + str(number), (10, 110),
                        cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1,
                        cv.LINE_AA)
+    return image
+
+
+def draw_status_panel(image, hand_label, direction, speed, avg_speed, motion_state, x_offset=10):
+    y0 = 130
+    line_height = 25
+    info_lines = [
+        f"{hand_label}",
+        f"Direction     : {direction}",
+        f"Speed         : {speed}",
+        f"Avg Speed     : {avg_speed}",
+        f"Motion Status : {motion_state}",
+    ]
+    for i, text in enumerate(info_lines):
+        y = y0 + i * line_height
+        cv.putText(image, text, (x_offset, y),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, cv.LINE_AA)
+        cv.putText(image, text, (x_offset, y),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
     return image
 
 
