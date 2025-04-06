@@ -14,7 +14,7 @@ import mediapipe as mp
 from utils import CvFpsCalc
 from model import KeyPointClassifier
 from model import PointHistoryClassifier
-
+from collections import defaultdict
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -57,7 +57,7 @@ def main():
     cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
 
-    # Model load #############################################################
+    # Model load #######################################################################
     mp_hands = mp.solutions.hands
     hands = mp_hands.Hands(
         static_image_mode=use_static_image_mode,
@@ -69,20 +69,23 @@ def main():
     keypoint_classifier = KeyPointClassifier()
     point_history_classifier = PointHistoryClassifier()
 
-    # Read labels ###########################################################
+    # Read labels ######################################################################
     with open('model/keypoint_classifier/keypoint_classifier_label.csv', encoding='utf-8-sig') as f:
         keypoint_classifier_labels = [row[0] for row in csv.reader(f)]
     with open('model/point_history_classifier/point_history_classifier_label.csv', encoding='utf-8-sig') as f:
         point_history_classifier_labels = [row[0] for row in csv.reader(f)]
 
-    # FPS Measurement ########################################################
+    # FPS Measurement ##################################################################
     cvFpsCalc = CvFpsCalc(buffer_len=10)
 
-    # Movement thresholds ####################################################
-    movement_direction_threshold = 5.0  # min speed to classify direction
-    motion_state_threshold = 5.0        # avg speed to classify as Moving
+    # Movement thresholds ##############################################################
+    movement_direction_threshold = 5.0
+    motion_state_threshold = 5.0
+    FLICK_THRESHOLD_LEFT = 15.0
+    FLICK_THRESHOLD_RIGHT_A = 20.0
+    FLICK_THRESHOLD_RIGHT_B = 20.0
 
-    # Histories #############################################################
+    # Histories ########################################################################
     history_length = 16
     point_histories = {"Left": deque(maxlen=history_length), "Right": deque(maxlen=history_length)}
     speed_histories = {"Left": deque(maxlen=5), "Right": deque(maxlen=5)}
@@ -90,7 +93,6 @@ def main():
     presence_history = {"Left": deque(maxlen=15), "Right": deque(maxlen=15)}
     finger_gesture_history = deque(maxlen=history_length)
 
-    # Last-known values #####################################################
     last_known = {
         "Left": {"direction": "-", "speed": "0.00", "avg_speed": "0.00", "motion": "-", "present": False},
         "Right": {"direction": "-", "speed": "0.00", "avg_speed": "0.00", "motion": "-", "present": False},
@@ -117,6 +119,7 @@ def main():
         image.flags.writeable = True
 
         detected_labels = []
+        interaction_status = defaultdict(str)  # NEW: safe default fallback
 
         if results.multi_hand_landmarks is not None:
             for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
@@ -134,7 +137,8 @@ def main():
                 presence_history[hand_label].append(True)
                 point_histories[hand_label].append(landmark_list[8])
 
-                # Speed & Direction
+                presence_score = sum(presence_history[hand_label]) / len(presence_history[hand_label])
+
                 if len(point_histories[hand_label]) >= 2:
                     dx = point_histories[hand_label][-1][0] - point_histories[hand_label][-2][0]
                     dy = point_histories[hand_label][-1][1] - point_histories[hand_label][-2][1]
@@ -160,8 +164,34 @@ def main():
                     avg_speed = 0.0
                     motion_state = "-"
 
-                # Update last known
-                presence_score = sum(presence_history[hand_label]) / len(presence_history[hand_label])
+                # Left hand interaction logic
+                if hand_label == "Left":
+                    if presence_score > 0.4:
+                        if avg_speed < motion_state_threshold:
+                            interaction_status["Left"] = "Motor: Stopped"
+                        else:
+                            if abs(dx) > abs(dy):
+                                if speed > FLICK_THRESHOLD_LEFT:
+                                    interaction_status["Left"] = f"Motor: FLICK {'Right' if dx > 0 else 'Left'}"
+                                else:
+                                    interaction_status["Left"] = f"Motor: Rotating {'Right' if dx > 0 else 'Left'}"
+                            else:
+                                interaction_status["Left"] = "Motor: ???"
+                    else:
+                        interaction_status["Left"] = "Motor: Idle"
+
+                # Right hand interaction logic
+                if hand_label == "Right" and presence_score > 0.4:
+                    if abs(dy) > abs(dx) and speed > 10:
+                        if dy < 0 and speed > FLICK_THRESHOLD_RIGHT_A:
+                            interaction_status["Right"] = "Solenoid A Triggered"
+                        elif dy > 0 and speed > FLICK_THRESHOLD_RIGHT_B:
+                            interaction_status["Right"] = "Solenoid B Triggered"
+                        else:
+                            interaction_status["Right"] = "Solenoid: flick too slow"
+                    else:
+                        interaction_status["Right"] = "Solenoid: -"
+
                 last_known[hand_label] = {
                     "direction": smoothed_direction,
                     "speed": f"{speed:.2f}",
@@ -170,7 +200,6 @@ def main():
                     "present": presence_score > 0.4,
                 }
 
-                # Gesture classification
                 hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
                 if len(pre_processed_point_history_list) == history_length * 2:
                     gesture_id = point_history_classifier(pre_processed_point_history_list)
@@ -187,7 +216,6 @@ def main():
                     point_history_classifier_labels[most_common_fg_id[0][0]] if most_common_fg_id else "",
                 )
 
-        # Fallback when no hand detected
         for label in ["Left", "Right"]:
             if label not in detected_labels:
                 presence_history[label].append(False)
@@ -208,7 +236,14 @@ def main():
                 x_offset=x_offset
             )
 
-        # Final overlays
+            # Show interaction keyword below the status panel
+            status_text = interaction_status[label]
+            if status_text:
+                cv.putText(debug_image, status_text, (x_offset, 270),
+                           cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv.LINE_AA)
+                cv.putText(debug_image, status_text, (x_offset, 270),
+                           cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv.LINE_AA)
+
         debug_image = draw_point_history(debug_image, point_histories["Left"])
         debug_image = draw_point_history(debug_image, point_histories["Right"])
         debug_image = draw_info(debug_image, fps, mode, number)
@@ -217,7 +252,6 @@ def main():
 
     cap.release()
     cv.destroyAllWindows()
-
 def select_mode(key, mode):
     number = -1
     if 48 <= key <= 57:  # 0 ~ 9
